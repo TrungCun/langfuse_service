@@ -1,8 +1,20 @@
-# Langfuse local service
+# Langfuse service trên LAN
 
 Dịch vụ Langfuse độc lập để các hệ thống agentic gửi tracing về một nơi.
 Giai đoạn hiện tại: thử nghiệm nội bộ trên Windows + Docker Desktop (Linux containers).
 Langfuse Web/API và Worker được ghim cùng phiên bản `4.50.0`; Python SDK `4.16.0`.
+
+## Nguồn cấu hình
+
+`docker-compose.yml` là bản **điều chỉnh từ Compose chính thức của Langfuse release
+4.50.0**, không phải nguyên bản upstream. Sáu thành phần, images và các biến kết nối
+storage dựa trên upstream; ứng dụng Langfuse chạy bằng images phát hành, không sửa source product.
+
+Các điều chỉnh của repo: ghim release Web/Worker; secrets bắt buộc và sinh ngẫu nhiên;
+mở Web/API và S3/media ra LAN; database không publish host ports; thêm health checks,
+Redis AOF, log rotation và các script/ví dụ riêng. `langfuse-service` chỉ là project name
+Docker Compose, dùng đặt tên containers/network/volumes, không phải một edition của Langfuse.
+YAML anchors (`&`, `*`, `<<`) chia sẻ cấu hình Web/Worker; upstream cũng dùng chúng.
 
 ## Khởi động
 
@@ -14,6 +26,7 @@ Từ PowerShell tại thư mục dự án:
 
 ```powershell
 python scripts/init_env.py
+python scripts/configure_lan.py --host 10.0.10.150
 .\scripts\stack.ps1 -Action validate
 .\scripts\stack.ps1 -Action start
 python scripts/health.py
@@ -38,16 +51,16 @@ Nếu shell bị hạn chế quyền đọc/chạy Docker CLI, chạy các lện
 Windows của bạn có quyền truy cập Docker Desktop. Không cài lại Docker chỉ vì CLI
 không truy cập được từ một phiên shell cụ thể.
 
-Mở <http://localhost:3000>, Sign up để tạo tài khoản đầu tiên, sau đó tạo organization,
+Mở <http://10.0.10.150:3000> từ máy host hoặc máy khác cùng LAN, Sign up để tạo tài khoản đầu tiên, sau đó tạo organization,
 project và API keys trong Project Settings. Không có tài khoản admin mặc định.
 Lưu API keys vào `examples/python/.env`, không vào cấu hình server.
 
 | Thành phần | Địa chỉ trên máy Windows |
 | --- | --- |
-| Web/UI/API | http://localhost:3000 |
+| Web/UI/API (LAN) | http://10.0.10.150:3000 |
 | Worker health | http://localhost:3030/api/health |
-| MinIO S3/media | http://localhost:9090 |
-| MinIO console | http://localhost:9091 |
+| MinIO S3/media (LAN) | http://10.0.10.150:9095 |
+| MinIO console | http://localhost:9096 |
 | PostgreSQL, ClickHouse, Redis | Chỉ trong mạng Docker Compose |
 
 `init_env.py` tạo secrets ngẫu nhiên, không ghi đè `.env` hiện có và không in secrets.
@@ -101,13 +114,11 @@ python examples/python/smoke_trace.py --offline
 
 | Agent chạy ở đâu | LANGFUSE_BASE_URL |
 | --- | --- |
-| Trực tiếp trên Windows | `http://localhost:3000` |
+| Máy Windows host hoặc máy khác cùng LAN | `http://10.0.10.150:3000` |
 | Container cùng mạng Compose | `http://langfuse-web:3000` |
-| Container Docker Desktop khác mạng | `http://host.docker.internal:3000` nếu kiểm tra truy cập thành công |
+| Container Docker Desktop khác mạng | `http://host.docker.internal:3000` |
 
-Đối với agent trong container, phương án ổn định là gắn container vào mạng
-`langfuse-local_default` và dùng `http://langfuse-web:3000`. Cổng host đang bind
-`127.0.0.1`; khả năng truy cập qua `host.docker.internal` tùy Docker Desktop và cần kiểm tra.
+Gắn container agent vào mạng `langfuse-service_default` để dùng endpoint nội bộ.
 Ví dụ cấu hình trong Compose của agent:
 
 ```yaml
@@ -120,12 +131,40 @@ services:
 networks:
   langfuse:
     external: true
-    name: langfuse-local_default
+    name: langfuse-service_default
 ```
 
-Media/multimodal cần endpoint S3 mà bên upload và browser truy cập được;
-ví dụ hiện tại chỉ gửi text. Chưa mở LAN. Khi mở LAN cần điều chỉnh bind, URLs,
-firewall, HTTPS và chính sách tài khoản trước khi đưa dữ liệu thật vào.
+Media/multimodal dùng endpoint công khai `http://10.0.10.150:9095` để browser/máy khác
+truy cập được; Web/Worker dùng endpoint nội bộ `http://minio:9000`. Ví dụ chỉ gửi text.
+Nếu DHCP đổi IP, chạy lại `configure_lan.py --host <IP-moi>`, recreate containers và
+cập nhật base URL ở các agent. Nên dùng DHCP reservation để giữ IP ổn định.
+
+### Windows Firewall và kiểm tra từ máy khác
+
+Web/API và S3/media bind `0.0.0.0`; Worker và console MinIO bind localhost,
+database/Redis chỉ trong Docker network. Chạy trong **PowerShell Administrator**
+trên máy host để cho phép hai cổng từ LocalSubnet:
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File scripts/allow_lan.ps1
+```
+
+ExecutionPolicy Bypass chỉ áp dụng cho tiến trình này, không đổi policy hệ thống.
+Nếu đổi ports trong `.env`, truyền `-WebPort` và `-MediaPort` tương ứng.
+Script tạo/cập nhật rule riêng của Langfuse; không đổi network profile.
+Không cần Administrator cho các lệnh Docker Compose thông thường.
+
+Từ máy khác cùng mạng:
+
+```powershell
+Test-NetConnection 10.0.10.150 -Port 3000
+Test-NetConnection 10.0.10.150 -Port 9095
+Invoke-RestMethod http://10.0.10.150:3000/api/public/health
+```
+
+Mở UI trên máy đó, rồi chạy ví dụ Python với project API keys và base URL LAN.
+Đây là HTTP cho mạng nội bộ tin cậy, chưa có TLS/public Internet ingress.
+Không cấu hình router port forwarding cho stack này.
 
 ## Vận hành và kiểm chứng
 
@@ -211,5 +250,6 @@ Xem `VALIDATION.md` để biết những bước đã chạy trong phiên triể
 - [Python SDK reference](https://python.reference.langfuse.com/langfuse)
 - [Releases](https://github.com/langfuse/langfuse/releases)
 
-#   l a n g f u s e _ s e r v i c e  
+#   l a n g f u s e _ s e r v i c e 
+ 
  
